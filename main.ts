@@ -165,12 +165,10 @@ function appendSvg(
 // ─────────────────────────────────────────────
 
 /**
- * Ensure the configured placeholder exists in a folder.
+ * Ensure the configured placeholder exists only when a folder
+ * contains no real files.
  *
- * Does nothing if:
- * - the folder is excluded
- * - the placeholder already exists
- *
+ * Child folders do not count as real files.
  * Existing placeholder files are NEVER modified.
  *
  * Returns true only when a file was created.
@@ -186,20 +184,23 @@ async function ensurePlaceholder(
 		return false;
 	}
 
-	const filePath = getPlaceholderPath(
-		folder,
-		filename
+	const hasRealFile = folder.children.some(
+		(child) =>
+			child instanceof TFile &&
+			child.name !== filename
 	);
+
+	if (hasRealFile) {
+		return false;
+	}
+
+	const filePath = getPlaceholderPath(folder, filename);
 
 	if (await app.vault.adapter.exists(filePath)) {
 		return false;
 	}
 
-	await app.vault.create(
-		filePath,
-		content
-	);
-
+	await app.vault.create(filePath, content);
 	return true;
 }
 
@@ -232,6 +233,49 @@ async function removePlaceholder(
 	await app.fileManager.trashFile(file);
 
 	return true;
+}
+
+/**
+ * Reconcile a folder's placeholder state.
+ *
+ * A managed folder contains the configured placeholder if and only if
+ * it contains no real files. Child folders do not count as real files.
+ */
+async function reconcileFolder(
+	app: App,
+	folder: TFolder,
+	filename: string,
+	content: string,
+	excluded: Set<string>
+): Promise<void> {
+	if (isFolderExcluded(folder.path, excluded)) {
+		return;
+	}
+
+	const hasRealFile = folder.children.some(
+		(child) =>
+			child instanceof TFile &&
+			child.name !== filename
+	);
+
+	if (hasRealFile) {
+		await removePlaceholder(app, folder, filename);
+		return;
+	}
+
+	await ensurePlaceholder(app, folder, filename, content, excluded);
+}
+
+/** Reconcile every managed folder in the vault. */
+async function reconcileAll(
+	app: App,
+	filename: string,
+	content: string,
+	excluded: Set<string>
+): Promise<void> {
+	for (const folder of getAllFolders(app)) {
+		await reconcileFolder(app, folder, filename, content, excluded);
+	}
 }
 
 /**
@@ -337,83 +381,159 @@ export default class AutoPlaceholderPlugin extends Plugin {
 			)
 		);
 
-		// Initial scan once the vault/workspace is ready.
-		this.app.workspace.onLayoutReady(
-			async () => {
-				if (!this.settings.autoEnabled) {
-					return;
-				}
-
-				await this.addMissingPlaceholders(
-					true
-				);
+		// Initial reconciliation once the vault/workspace is ready.
+		this.app.workspace.onLayoutReady(async () => {
+			if (!this.settings.autoEnabled) {
+				return;
 			}
-		);
 
-		// Watch for newly created folders.
+			const excluded = parseExcluded(
+				this.settings.excludedPaths
+			);
+
+			await reconcileAll(
+				this.app,
+				this.settings.placeholderFilename,
+				this.settings.placeholderContent,
+				excluded
+			);
+		});
+
+		// Reconcile folders whenever a folder or file is created.
 		this.registerEvent(
 			this.app.vault.on(
 				"create",
 				async (file: TAbstractFile) => {
+					if (!this.settings.autoEnabled) {
+						return;
+					}
+
+					const excluded = parseExcluded(
+						this.settings.excludedPaths
+					);
+
+					if (file instanceof TFolder) {
+						await reconcileFolder(
+							this.app,
+							file,
+							this.settings.placeholderFilename,
+							this.settings.placeholderContent,
+							excluded
+						);
+						return;
+					}
+
 					if (
-						!this.settings.autoEnabled
+						file instanceof TFile &&
+						file.name !== this.settings.placeholderFilename &&
+						file.parent
+					) {
+						await reconcileFolder(
+							this.app,
+							file.parent,
+							this.settings.placeholderFilename,
+							this.settings.placeholderContent,
+							excluded
+						);
+					}
+				}
+			)
+		);
+
+		// Restore placeholders when real files are deleted.
+		this.registerEvent(
+			this.app.vault.on(
+				"delete",
+				async (file: TAbstractFile) => {
+					if (
+						!this.settings.autoEnabled ||
+						!(file instanceof TFile) ||
+						file.name === this.settings.placeholderFilename
 					) {
 						return;
 					}
 
-					if (!(file instanceof TFolder)) {
+					// After deletion Obsidian may no longer expose file.parent reliably,
+					// so derive the surviving parent folder from the deleted path.
+					const slash = file.path.lastIndexOf("/");
+					const parentPath = slash === -1 ? "" : file.path.slice(0, slash);
+					const parent = this.app.vault.getAbstractFileByPath(parentPath);
+
+					if (!(parent instanceof TFolder)) {
 						return;
 					}
 
-					const excluded =
-						parseExcluded(
-							this.settings
-								.excludedPaths
-						);
+					const excluded = parseExcluded(
+						this.settings.excludedPaths
+					);
 
-					await ensurePlaceholder(
+					await reconcileFolder(
 						this.app,
-						file,
-						this.settings
-							.placeholderFilename,
-						this.settings
-							.placeholderContent,
+						parent,
+						this.settings.placeholderFilename,
+						this.settings.placeholderContent,
 						excluded
 					);
 				}
 			)
 		);
 
-		// Ensure renamed folders still contain the configured placeholder.
+		// Reconcile both sides of file moves and renamed folders.
 		this.registerEvent(
 			this.app.vault.on(
 				"rename",
-				async (file: TAbstractFile) => {
-					if (
-						!this.settings.autoEnabled
-					) {
+				async (file: TAbstractFile, oldPath: string) => {
+					if (!this.settings.autoEnabled) {
 						return;
 					}
 
-					if (!(file instanceof TFolder)) {
-						return;
-					}
-
-					const excluded =
-						parseExcluded(
-							this.settings
-								.excludedPaths
-						);
-
-					await ensurePlaceholder(
-						this.app,
-						file,
-						this.settings
-							.placeholderFilename,
-						this.settings
-							.placeholderContent,
-						excluded
+					const excluded = parseExcluded(
+						this.settings.excludedPaths
 					);
+
+					if (file instanceof TFolder) {
+						await reconcileFolder(
+							this.app,
+							file,
+							this.settings.placeholderFilename,
+							this.settings.placeholderContent,
+							excluded
+						);
+						return;
+					}
+
+					if (!(file instanceof TFile)) {
+						return;
+					}
+
+					// Reconcile the new parent.
+					if (file.parent) {
+						await reconcileFolder(
+							this.app,
+							file.parent,
+							this.settings.placeholderFilename,
+							this.settings.placeholderContent,
+							excluded
+						);
+					}
+
+					// If the file moved between folders, reconcile the old parent too.
+					const slash = oldPath.lastIndexOf("/");
+					const oldParentPath = slash === -1 ? "" : oldPath.slice(0, slash);
+					const oldParent = this.app.vault.getAbstractFileByPath(oldParentPath);
+
+					if (
+						oldParent instanceof TFolder &&
+						oldParent !== file.parent
+					) {
+						await reconcileFolder(
+							this.app,
+							oldParent,
+							this.settings.placeholderFilename,
+							this.settings.placeholderContent,
+							excluded
+						);
+					}
 				}
 			)
 		);
